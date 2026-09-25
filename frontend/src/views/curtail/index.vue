@@ -19,9 +19,16 @@
     </div>
 
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>事件编号</span>
+        <input v-model="keyword" placeholder="按事件编号检索" />
+      </label>
+      <label class="filter-item">
+        <span>限电状态</span>
+        <select v-model="statusFilter" class="filter-select">
+          <option value="">全部状态</option>
+          <option v-for="item in statuses" :key="item" :value="item">{{ item }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -38,11 +45,13 @@
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
+            <button class="link" type="button" @click="openDetail(row)">详情</button>
             <button
-              v-for="action in actions"
+              v-for="action in availableActions(row)"
               :key="action"
               class="link"
               type="button"
+              :disabled="acting"
               @click="runAction(action, row)"
             >
               {{ action }}
@@ -56,9 +65,24 @@
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条限电记录记录</span>
+      <span>共 {{ total }} 条限电记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <div v-if="detail" class="modal-mask" @click.self="closeDetail">
+      <div class="modal-card">
+        <header class="modal-head">
+          <h3>限电事件详情</h3>
+          <button class="link" type="button" @click="closeDetail">关闭</button>
+        </header>
+        <dl class="detail-grid">
+          <template v-for="field in detailFields" :key="field">
+            <dt>{{ field }}</dt>
+            <dd>{{ detail[field] ?? '—' }}</dd>
+          </template>
+        </dl>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -68,21 +92,47 @@ import { onMounted, ref } from 'vue'
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
+type StatCard = { label: string; value: string | number }
 
 const ENDPOINT = '/api/curtail'
 const columns = ["事件编号", "所属电站", "限电原因", "限电开始时间", "限电结束时间", "损失电量", "调度指令号", "限电状态"]
-const actions = ["确认限电", "确认恢复", "提交申诉"]
 const statuses = ["待确认", "已确认", "已恢复", "已申诉"]
-const stats = [{"label": "今日限电次数", "value": 0}, {"label": "损失电量合计", "value": 0}, {"label": "待申诉事件", "value": 0}]
+const detailFields = [...columns, "恢复时间"]
 
 const rows = ref<Row[]>([])
+const stats = ref<StatCard[]>([
+  { label: '今日限电次数', value: 0 },
+  { label: '损失电量合计', value: 0 },
+  { label: '待申诉事件', value: 0 },
+])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const keyword = ref('')
+const statusFilter = ref('')
+const acting = ref(false)
+const detail = ref<Row | null>(null)
+
+function buildQuery() {
+  const params = new URLSearchParams()
+  if (keyword.value.trim()) params.set('keyword', keyword.value.trim())
+  if (statusFilter.value) params.set('status', statusFilter.value)
+  const query = params.toString()
+  return query ? `?${query}` : ''
+}
+
+// 每个状态只露出能生效的动作；提交申诉沿用老流程，任意状态都可发起。
+function availableActions(row: Row): string[] {
+  const status = String(row['限电状态'] ?? row.status ?? '')
+  const result: string[] = []
+  if (status === '待确认') result.push('确认限电')
+  if (status === '已确认') result.push('确认恢复')
+  result.push('提交申诉')
+  return result
+}
 
 function resetFilters() {
-  filters.value = {}
+  keyword.value = ''
+  statusFilter.value = ''
   void reload()
 }
 
@@ -95,32 +145,61 @@ function openCreate() {
 }
 
 async function runAction(action: string, row: Row) {
+  if (acting.value) return
+  acting.value = true
   errorMessage.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ values: { action } }),
     })
-    if (!response.ok) {
-      throw new Error('限电记录动作未生效，请稍后重试')
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message ?? '限电记录动作未生效，请稍后重试')
     }
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '限电记录操作失败'
+  } finally {
+    acting.value = false
   }
+}
+
+async function openDetail(row: Row) {
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/${row.id}`)
+    if (!response.ok) {
+      throw new Error('限电事件详情读取失败')
+    }
+    detail.value = (await response.json()) as Row
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '限电事件详情读取失败'
+  }
+}
+
+function closeDetail() {
+  detail.value = null
 }
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = buildQuery()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    const [listResponse, statsResponse] = await Promise.all([
+      request(`${ENDPOINT}${query}`),
+      request(`${ENDPOINT}/stats${query}`),
+    ])
+    if (!listResponse.ok) {
       throw new Error('限电事件列表读取失败')
     }
-    const payload = await response.json()
+    const payload = await listResponse.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    if (statsResponse.ok) {
+      const statsPayload = await statsResponse.json()
+      stats.value = statsPayload.items ?? stats.value
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '限电记录列表读取失败'
   }
@@ -128,3 +207,55 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.filter-select {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: #fff;
+  min-width: 120px;
+}
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.modal-card {
+  background: #fff;
+  border-radius: 8px;
+  padding: 16px 20px;
+  width: 520px;
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow: auto;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.modal-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+.detail-grid dt {
+  color: var(--muted);
+}
+.detail-grid dd {
+  margin: 0;
+  word-break: break-all;
+}
+</style>

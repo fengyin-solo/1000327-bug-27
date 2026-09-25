@@ -16,6 +16,22 @@ LIST_FIELDS = ["事件编号", "所属电站", "限电原因", "限电开始时�
 STATUSES = ["待确认", "已确认", "已恢复", "已申诉"]
 
 
+@router.get("/stats")
+def curtail_stats(
+    keyword: str | None = Query(default=None, description="按事件编号检索"),
+    status: str | None = Query(default=None, description="待确认、已确认、已恢复、已申诉"),
+) -> dict[str, Any]:
+    """限电统计卡片：与列表共用筛选口径，动作生效后随列表一起刷新。"""
+    return {"items": service.summarize(keyword=keyword, status=status)}
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出限电记录清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "curtail", "total": total, "items": items}
+
+
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按事件编号检索"),
@@ -56,10 +72,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出限电记录清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "curtail", "total": total, "items": items}
